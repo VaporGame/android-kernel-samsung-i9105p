@@ -3,7 +3,7 @@
 #
 
 
-obj-$(CONFIG_REGULATOR) += core.o dummy.o
+obj-$(CONFIG_REGULATOR) += core.o dummy.o 
 obj-$(CONFIG_REGULATOR_FIXED_VOLTAGE) += fixed.o
 obj-$(CONFIG_REGULATOR_VIRTUAL_CONSUMER) += virtual.o
 obj-$(CONFIG_REGULATOR_USERSPACE_CONSUMER) += userspace-consumer.o
@@ -43,5 +43,11 @@ obj-$(CONFIG_REGULATOR_ISL6271A) += isl6271a-regulator.o
 obj-$(CONFIG_REGULATOR_AB8500)	+= ab8500.o
 obj-$(CONFIG_REGULATOR_DB8500_PRCMU) += db8500-prcmu.o
 obj-$(CONFIG_REGULATOR_TPS65910) += tps65910-regulator.o
+
+obj-$(CONFIG_REGULATOR_BCM_PMU59055) += bcm590xx-regulator.o bcm59055_A0.o
+obj-$(CONFIG_REGULATOR_BCM59056) += bcmpmu-regulator.o bcmpmu-rgltr-bcm59056.o
+obj-$(CONFIG_REGULATOR_BCM59054) += bcmpmu-regulator.o bcmpmu-rgltr-bcm59054.o
+obj-$(CONFIG_REGULATOR_TPS728XX) += tps728xx-regulator.o
+		
 
 ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG

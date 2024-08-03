@@ -41,8 +41,16 @@
 #include <linux/cpu.h>
 #include <linux/notifier.h>
 #include <linux/rculist.h>
+#include <trace/stm.h>
 
 #include <asm/uaccess.h>
+
+#if defined (CONFIG_SEC_DEBUG)
+#include <mach/sec_debug.h>
+#endif
+
+void (* BrcmLogString)(const char *inLogString,
+				unsigned short inSender) = 0;
 
 /*
  * Architectures can override it:
@@ -145,8 +153,8 @@ static int console_may_schedule;
 #ifdef CONFIG_PRINTK
 
 static char __log_buf[__LOG_BUF_LEN];
-static char *log_buf = __log_buf;
-static int log_buf_len = __LOG_BUF_LEN;
+char *log_buf = __log_buf;
+int log_buf_len = __LOG_BUF_LEN;
 static unsigned logged_chars; /* Number of chars produced since last read+clear operation */
 static int saved_console_loglevel = -1;
 
@@ -192,8 +200,15 @@ void __init setup_log_buf(int early)
 	char *new_log_buf;
 	int free;
 
-	if (!new_log_buf_len)
+	if (!new_log_buf_len){
+#if defined(CONFIG_SEC_DEBUG)
+		//{{ Mark for GetLog
+		sec_getlog_supply_kloginfo(__log_buf);
+		//}} Mark for GetLog
+#endif
+  
 		return;
+	}
 
 	if (early) {
 		unsigned long mem;
@@ -231,7 +246,11 @@ void __init setup_log_buf(int early)
 	con_start -= offset;
 	log_end -= offset;
 	spin_unlock_irqrestore(&logbuf_lock, flags);
-
+#if defined(CONFIG_SEC_DEBUG)
+	//{{ Mark for GetLog
+	sec_getlog_supply_kloginfo(__log_buf);
+	//}} Mark for GetLog
+#endif
 	pr_info("log_buf_len: %d\n", log_buf_len);
 	pr_info("early log buf free: %d(%d%%)\n",
 		free, (free * 100) / __LOG_BUF_LEN);
@@ -289,6 +308,53 @@ static inline void boot_delay_msec(void)
 {
 }
 #endif
+
+/*
+ * Return the number of unread characters in the log buffer.
+ */
+static int log_buf_get_len(void)
+{
+	return logged_chars;
+}
+
+/*
+ * Clears the ring-buffer
+ */
+void log_buf_clear(void)
+{
+	logged_chars = 0;
+}
+
+/*
+ * Copy a range of characters from the log buffer.
+ */
+int log_buf_copy(char *dest, int idx, int len)
+{
+	int ret, max;
+	bool took_lock = false;
+
+	if (!oops_in_progress) {
+		spin_lock_irq(&logbuf_lock);
+		took_lock = true;
+	}
+
+	max = log_buf_get_len();
+	if (idx < 0 || idx >= max) {
+		ret = -1;
+	} else {
+		if (len > max - idx)
+			len = max - idx;
+		ret = len;
+		idx += (log_end - max);
+		while (len-- > 0)
+			dest[len] = LOG_BUF(idx + len);
+	}
+
+	if (took_lock)
+		spin_unlock_irq(&logbuf_lock);
+
+	return ret;
+}
 
 #ifdef CONFIG_SECURITY_DMESG_RESTRICT
 int dmesg_restrict = 1;
@@ -825,6 +891,72 @@ static inline void printk_delay(void)
 	}
 }
 
+//#ifdef CONFIG_BRCM_UNIFIED_LOGGING
+/* Unified logging */
+
+int bcmlog_mtt_on;
+unsigned short bcmlog_log_ulogging_id;
+
+/* ------------------------------------------------------------ */
+int brcm_retrive_early_printk(void)
+{
+	/* int printed_len = length; */
+	unsigned long flags;
+	int this_cpu;
+	/* char *p = data; */
+
+	preempt_disable();
+	/* This stops the holder of brcm_console_sem just where we want him */
+	raw_local_irq_save(flags);
+	this_cpu = smp_processor_id();
+
+	/*
+	 * Ouch, printk recursed into itself!
+	 */
+	if (unlikely(printk_cpu == this_cpu)) {
+		/*
+		 * If a crash is occurring during printk() on this CPU,
+		 * then try to get the crash message out but make sure
+		 * we can't deadlock. Otherwise just return to avoid the
+		 * recursion and return - but flag the recursion so that
+		 * it can be printed at the next appropriate moment:
+		 */
+		if (!oops_in_progress) {
+			recursion_bug = 1;
+			goto end_restore_irqs;
+		}
+		zap_locks();
+	}
+
+	lockdep_off();
+	spin_lock(&logbuf_lock);
+	printk_cpu = this_cpu;
+
+	if (bcmlog_log_ulogging_id > 0 && BrcmLogString)
+		BrcmLogString(log_buf, bcmlog_log_ulogging_id);
+
+	/*
+	 * Try to acquire and then immediately release the
+	 * brcm_console semaphore. The release will do all the
+	 * actual magic (print out buffers, wake up klogd,
+	 * etc).
+	 *
+	 * The acquire_brcm_console_semaphore_for_printk() function
+	 * will release 'logbuf_lock' regardless of whether it
+	 * actually gets the semaphore or not.
+	 */
+	if (console_trylock_for_printk(this_cpu))
+		console_unlock();
+
+	lockdep_on();
+
+end_restore_irqs:
+	raw_local_irq_restore(flags);
+
+	preempt_enable();
+	return 0;
+}//#endif
+
 asmlinkage int vprintk(const char *fmt, va_list args)
 {
 	int printed_len = 0;
@@ -874,8 +1006,9 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 	printed_len += vscnprintf(printk_buf + printed_len,
 				  sizeof(printk_buf) - printed_len, fmt, args);
 
-	p = printk_buf;
 
+	p = printk_buf;
+	
 	/* Read log level and handle special printk prefix */
 	plen = log_prefix(p, &current_log_level, &special);
 	if (plen) {
@@ -895,6 +1028,10 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 		}
 	}
 
+//#ifdef CONFIG_BRCM_UNIFIED_LOGGING
+if (bcmlog_mtt_on == 1 && bcmlog_log_ulogging_id > 0 && BrcmLogString)
+	BrcmLogString(printk_buf, bcmlog_log_ulogging_id);
+//#endif
 	/*
 	 * Copy the output into log_buf. If the caller didn't provide
 	 * the appropriate log prefix, we insert them here
@@ -927,9 +1064,10 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 
 				t = cpu_clock(printk_cpu);
 				nanosec_rem = do_div(t, 1000000000);
-				tlen = sprintf(tbuf, "[%5lu.%06lu] ",
+				tlen = sprintf(tbuf, "[%5lu.%06lu] {%lu}",
 						(unsigned long) t,
-						nanosec_rem / 1000);
+						nanosec_rem / 1000,
+						jiffies);
 
 				for (tp = tbuf; tp < tbuf + tlen; tp++)
 					emit_log_char(*tp);
@@ -1131,6 +1269,15 @@ void resume_console(void)
 	console_unlock();
 }
 
+#if defined( CONFIG_MACH_CAPRI_SS_BAFFIN_CMCC)||defined( CONFIG_MACH_CAPRI_SS_CRATER_CMCC)
+int get_console_suspended(void)
+{
+	return console_suspended ;
+}
+
+EXPORT_SYMBOL(get_console_suspended);
+#endif
+
 /**
  * console_cpu_notify - print deferred console messages after CPU hotplug
  * @self: notifier struct
@@ -1148,7 +1295,6 @@ static int __cpuinit console_cpu_notify(struct notifier_block *self,
 	switch (action) {
 	case CPU_ONLINE:
 	case CPU_DEAD:
-	case CPU_DYING:
 	case CPU_DOWN_FAILED:
 	case CPU_UP_CANCELED:
 		console_lock();
@@ -1175,6 +1321,7 @@ void console_lock(void)
 	console_may_schedule = 1;
 }
 EXPORT_SYMBOL(console_lock);
+EXPORT_SYMBOL(BrcmLogString);
 
 /**
  * console_trylock - try to lock the console system for exclusive use.

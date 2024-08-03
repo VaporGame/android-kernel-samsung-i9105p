@@ -405,10 +405,10 @@ static int acm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 			usb_ep_disable(acm->notify);
 		} else {
 			VDBG(cdev, "init acm ctrl interface %d\n", intf);
-			acm->notify_desc = ep_choose(cdev->gadget,
-					acm->hs.notify,
-					acm->fs.notify);
 		}
+		acm->notify_desc = ep_choose(cdev->gadget,
+				acm->hs.notify,
+				acm->fs.notify);
 		usb_ep_enable(acm->notify, acm->notify_desc);
 		acm->notify->driver_data = acm;
 
@@ -418,11 +418,11 @@ static int acm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 			gserial_disconnect(&acm->port);
 		} else {
 			DBG(cdev, "activate acm ttyGS%d\n", acm->port_num);
-			acm->port.in_desc = ep_choose(cdev->gadget,
-					acm->hs.in, acm->fs.in);
-			acm->port.out_desc = ep_choose(cdev->gadget,
-					acm->hs.out, acm->fs.out);
 		}
+		acm->port.in_desc = ep_choose(cdev->gadget,
+				acm->hs.in, acm->fs.in);
+		acm->port.out_desc = ep_choose(cdev->gadget,
+				acm->hs.out, acm->fs.out);
 		gserial_connect(&acm->port, acm->port_num);
 
 	} else
@@ -542,14 +542,28 @@ static void acm_connect(struct gserial *port)
 {
 	struct f_acm		*acm = port_to_acm(port);
 
+        printk("USBD][%s] ACM node open\n",__func__);
+
 	acm->serial_state |= ACM_CTRL_DSR | ACM_CTRL_DCD;
 	acm_notify_serial_state(acm);
+#ifdef CONFIG_BRCM_FUSE_LOG
+	if (acm->port_num == ACM_LOGGING_PORT)
+		if (acm_logging_cb->start)
+			acm_logging_cb->start();
+#endif
 }
 
 static void acm_disconnect(struct gserial *port)
 {
 	struct f_acm		*acm = port_to_acm(port);
 
+        printk("USBD][%s] ACM node close\n",__func__);
+
+#ifdef CONFIG_BRCM_FUSE_LOG
+	if (acm->port_num == ACM_LOGGING_PORT)
+		if (acm_logging_cb->stop)
+			acm_logging_cb->stop();
+#endif
 	acm->serial_state &= ~(ACM_CTRL_DSR | ACM_CTRL_DCD);
 	acm_notify_serial_state(acm);
 }
@@ -583,9 +597,9 @@ acm_bind(struct usb_configuration *c, struct usb_function *f)
 	status = usb_interface_id(c, f);
 	if (status < 0)
 		goto fail;
-	acm->ctrl_id = status;
+	acm->ctrl_id = status;	
 	acm_iad_descriptor.bFirstInterface = status;
-
+	
 	acm_control_interface_desc.bInterfaceNumber = status;
 	acm_union_desc .bMasterInterface0 = status;
 
@@ -669,6 +683,9 @@ acm_bind(struct usb_configuration *c, struct usb_function *f)
 			gadget_is_dualspeed(c->cdev->gadget) ? "dual" : "full",
 			acm->port.in->name, acm->port.out->name,
 			acm->notify->name);
+#ifdef CONFIG_BRCM_FUSE_LOG
+	acm_logging_cb = get_acm_callback_func();
+#endif
 	return 0;
 
 fail:
@@ -697,6 +714,7 @@ acm_unbind(struct usb_configuration *c, struct usb_function *f)
 		usb_free_descriptors(f->hs_descriptors);
 	usb_free_descriptors(f->descriptors);
 	gs_free_req(acm->notify, acm->notify_req);
+	kfree(acm->port.func.name);
 	kfree(acm);
 }
 
@@ -755,6 +773,12 @@ int acm_bind_config(struct usb_configuration *c, u8 port_num)
 		acm_iad_descriptor.iFunction = status;
 	}
 
+	if(port_num == 0) /*make first acm as a Modem*/
+		acm_data_interface_desc.bInterfaceProtocol = 0x00;	
+	/* make second acm instance as a serial comm driver */	
+	else if (port_num == 1)
+		acm_data_interface_desc.bInterfaceProtocol = 0xFF;
+
 	/* allocate and initialize one new instance */
 	acm = kzalloc(sizeof *acm, GFP_KERNEL);
 	if (!acm)
@@ -768,14 +792,18 @@ int acm_bind_config(struct usb_configuration *c, u8 port_num)
 	acm->port.disconnect = acm_disconnect;
 	acm->port.send_break = acm_send_break;
 
-	acm->port.func.name = "acm";
+	acm->port.func.name = kasprintf(GFP_KERNEL, "acm%u", port_num);
+	if (!acm->port.func.name) {
+		kfree(acm);
+		return -ENOMEM;
+	}
 	acm->port.func.strings = acm_strings;
 	/* descriptors are per-instance copies */
 	acm->port.func.bind = acm_bind;
 	acm->port.func.unbind = acm_unbind;
 	acm->port.func.set_alt = acm_set_alt;
 	acm->port.func.setup = acm_setup;
-	acm->port.func.disable = acm_disable;
+	acm->port.func.disable = acm_disable;	
 
 	status = usb_add_function(c, &acm->port.func);
 	if (status)

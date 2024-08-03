@@ -115,6 +115,7 @@ struct sdhci_host {
 #define SDHCI_NEEDS_RETUNING	(1<<5)	/* Host needs retuning */
 #define SDHCI_AUTO_CMD12	(1<<6)	/* Auto CMD12 support */
 #define SDHCI_AUTO_CMD23	(1<<7)	/* Auto CMD23 support */
+#define SDHCI_PV_ENABLED        (1<<8)  /* Preset value enabled */
 
 	unsigned int version;	/* SDHCI spec. version */
 
@@ -146,6 +147,8 @@ struct sdhci_host {
 
 	struct timer_list timer;	/* Timer for timeouts */
 
+	struct work_struct wait_erase_work; /* work to wait for erase to finish */
+
 	unsigned int caps;	/* Alternative capabilities */
 
 	unsigned int            ocr_avail_sdio;	/* OCR bit masks */
@@ -159,6 +162,10 @@ struct sdhci_host {
 	unsigned int		tuning_mode;	/* Re-tuning mode supported by host */
 #define SDHCI_TUNING_MODE_1	0
 	struct timer_list	tuning_timer;	/* Timer for tuning */
+
+#ifdef CONFIG_SDHCI_THROUGHPUT
+	u8 thrpt_dbgfs_enable;
+#endif
 
 	unsigned long private[0] ____cacheline_aligned;
 };

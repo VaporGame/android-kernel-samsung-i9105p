@@ -298,6 +298,46 @@ ATTR_STORE_FN(disabled_switches, EV_SW);
  * /sys/devices/platform/gpio-keys/disabled_keys [rw]
  * /sys/devices/platform/gpio-keys/disables_switches [rw]
  */
+
+ /* sys fs  */
+struct class *key_class;
+EXPORT_SYMBOL(key_class);
+struct device *key_dev;
+EXPORT_SYMBOL(key_dev);
+
+extern unsigned int bcmpmu_get_ponkey_state(void);
+
+static int keyreadstatus=0;
+
+static ssize_t key_show(struct device *dev, struct device_attribute *attr, char *buf);
+static DEVICE_ATTR(keyshort, S_IRUGO, key_show, NULL);
+
+static ssize_t key_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    uint8_t keys_pressed;
+    uint32_t onkey_pressed = 0;
+
+    onkey_pressed = bcmpmu_get_ponkey_state();
+
+	printk("[GPIO_KEY] %s, keyreadstatus%d\n", __func__, keyreadstatus);
+
+	if(keyreadstatus || onkey_pressed)
+    {
+        /* key press */
+        keys_pressed = 1;
+        
+    } 
+    else 
+    {
+        /* key release */
+        keys_pressed = 0;                        
+    }
+
+     return sprintf(buf, "%d\n", keys_pressed );
+}
+/* sys fs */
+
+
 static DEVICE_ATTR(disabled_keys, S_IWUSR | S_IRUGO,
 		   gpio_keys_show_disabled_keys,
 		   gpio_keys_store_disabled_keys);
@@ -328,7 +368,21 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 		if (state)
 			input_event(input, type, button->code, button->value);
 	} else {
-		input_event(input, type, button->code, !!state);
+		if ( state && button->wakeup == 1 && button->suspend_resume_state == 2)	{	
+			printk("\n gpio_keys_report_event state =1, reset flag \n");
+			button->suspend_resume_state = 0;
+		}
+		else if (state == 0 && button->wakeup == 1 && button->suspend_resume_state == 2) {
+             		input_event(input, type, button->code, 1);
+			input_sync(input);
+			printk("\n gpio_keys_report_event state =0, reset flag \n");
+			button->suspend_resume_state = 0;	
+		}	
+                input_event(input, type, button->code, !!state);
+
+		printk("[GPIO_KEY] code=%d, key state=%d\n",button->code, !!state);
+
+		keyreadstatus = !!state;
 	}
 	input_sync(input);
 }
@@ -352,9 +406,12 @@ static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
 {
 	struct gpio_button_data *bdata = dev_id;
 	struct gpio_keys_button *button = bdata->button;
-
+	printk("\n Debug: gpio_keys_isr called \n");
 	BUG_ON(irq != gpio_to_irq(button->gpio));
 
+	if ( button->wakeup == 1 && button->suspend_resume_state == 1)
+		button->suspend_resume_state = 2;
+	
 	if (bdata->timer_debounce)
 		mod_timer(&bdata->timer,
 			jiffies + msecs_to_jiffies(bdata->timer_debounce));
@@ -407,7 +464,7 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 		goto fail3;
 	}
 
-	irqflags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING;
+	irqflags = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_NO_SUSPEND;
 	/*
 	 * If platform has specified that the button can be disabled,
 	 * we don't want it to share the interrupt line.
@@ -527,6 +584,22 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 
 	device_init_wakeup(&pdev->dev, wakeup);
 
+
+     /* sys fs */
+	key_class = class_create(THIS_MODULE, "keyclass");
+	if (IS_ERR(key_class))
+		pr_err("Failed to create class(key)!\n");
+
+	key_dev = device_create(key_class, NULL, 0, NULL, "keypad");
+	if (IS_ERR(key_dev))
+		pr_err("Failed to create device(key)!\n");
+
+	if (device_create_file(key_dev, &dev_attr_keyshort) < 0)
+		pr_err("Failed to create device file(%s)!\n", dev_attr_keyshort.attr.name); 
+	/* sys fs */
+
+
+
 	return 0;
 
  fail3:
@@ -580,17 +653,21 @@ static int gpio_keys_suspend(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
 	int i;
-
+	
+	
 	if (device_may_wakeup(&pdev->dev)) {
 		for (i = 0; i < pdata->nbuttons; i++) {
 			struct gpio_keys_button *button = &pdata->buttons[i];
 			if (button->wakeup) {
 				int irq = gpio_to_irq(button->gpio);
-				enable_irq_wake(irq);
+				//enable_irq_wake(irq);
 			}
+			if (button->wakeup == 1 && button->suspend_resume_state == 0 )
+        		{
+            			button->suspend_resume_state = 1;
+        		}
 		}
-	}
-
+	}	
 	return 0;
 }
 
@@ -606,9 +683,8 @@ static int gpio_keys_resume(struct device *dev)
 		struct gpio_keys_button *button = &pdata->buttons[i];
 		if (button->wakeup && device_may_wakeup(&pdev->dev)) {
 			int irq = gpio_to_irq(button->gpio);
-			disable_irq_wake(irq);
+			//disable_irq_wake(irq);
 		}
-
 		gpio_keys_report_event(&ddata->data[i]);
 	}
 	input_sync(ddata->input);

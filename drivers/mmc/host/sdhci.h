@@ -1,5 +1,6 @@
 /*
- *  linux/drivers/mmc/host/sdhci.h - Secure Digital Host Controller Interface driver
+ *  linux/drivers/mmc/host/sdhci.h - Secure Digital Host Controller
+ *  Interface driver
  *
  * Header file for Host Controller registers and I/O accessors.
  *
@@ -20,6 +21,9 @@
 
 #include <linux/mmc/sdhci.h>
 
+#ifdef CONFIG_MMC_BCM_SD
+#define SDHCI_HOST_MAX_CLK_LS_MODE	25000000
+#endif
 /*
  * Controller registers
  */
@@ -71,6 +75,7 @@
 #define  SDHCI_CARD_PRESENT	0x00010000
 #define  SDHCI_WRITE_PROTECT	0x00080000
 #define  SDHCI_DATA_LVL_MASK	0x00F00000
+#define SDHCI_DATA_LVL_DAT0_MASK 0x00100000
 #define   SDHCI_DATA_LVL_SHIFT	20
 
 #define SDHCI_HOST_CONTROL	0x28
@@ -239,7 +244,6 @@
 /*
  * End of controller registers.
  */
-
 #define SDHCI_MAX_DIV_SPEC_200	256
 #define SDHCI_MAX_DIV_SPEC_300	2046
 
@@ -262,6 +266,13 @@ struct sdhci_ops {
 	void	(*set_clock)(struct sdhci_host *host, unsigned int clock);
 
 	int		(*enable_dma)(struct sdhci_host *host);
+#ifdef CONFIG_MMC_SDHCI_PLTFM_KONA
+	unsigned long	(*get_max_clk)(struct sdhci_host *host);
+	int		(*clk_enable)(struct sdhci_host *host, int enable);
+	int (*set_signalling)(struct sdhci_host *host, int sig_vol);
+	int (*platform_set)(struct sdhci_host *host, int enable, int lazy);
+	int (*set_regulator)(struct sdhci_host *host, int power_state);
+#endif
 	unsigned int	(*get_max_clock)(struct sdhci_host *host);
 	unsigned int	(*get_min_clock)(struct sdhci_host *host);
 	unsigned int	(*get_timeout_clock)(struct sdhci_host *host);
@@ -273,6 +284,8 @@ struct sdhci_ops {
 	void	(*platform_reset_enter)(struct sdhci_host *host, u8 mask);
 	void	(*platform_reset_exit)(struct sdhci_host *host, u8 mask);
 	int	(*set_uhs_signaling)(struct sdhci_host *host, unsigned int uhs);
+	int	(*platform_set_timeout)(struct sdhci_host *host, unsigned int timeout);
+	int	(*platform_get_timeout)(struct sdhci_host *host, bool def_val, unsigned int *timeout);
 
 };
 
@@ -377,6 +390,7 @@ extern void sdhci_remove_host(struct sdhci_host *host, int dead);
 extern int sdhci_suspend_host(struct sdhci_host *host, pm_message_t state);
 extern int sdhci_resume_host(struct sdhci_host *host);
 extern void sdhci_enable_irq_wakeups(struct sdhci_host *host);
+extern void sdhci_disable_irq_wakeups(struct sdhci_host *host);
 #endif
 
 #endif /* __SDHCI_HW_H */

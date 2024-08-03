@@ -2919,6 +2919,18 @@ static int __init regulator_init_complete(void)
 		if (!ops->disable || (c && c->always_on))
 			continue;
 
+#if defined(CONFIG_MACH_CAPRI_SS_BAFFIN)				
+		if (!strcmp(c->name, "camldo2")) 
+			continue;
+#endif
+
+#if defined(CONFIG_MACH_CAPRI_SS_CRATER)
+   	if (!strcmp(c->name, "gpldo5")){
+			printk("test test ~~~~~~ \n");
+			continue;
+		}
+#endif
+
 		mutex_lock(&rdev->mutex);
 
 		if (rdev->use_count)

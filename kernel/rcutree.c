@@ -51,6 +51,9 @@
 #include <linux/kthread.h>
 #include <linux/prefetch.h>
 
+#ifdef CONFIG_ARCH_KONA
+#include <mach/kona_timer.h>
+#endif
 #include "rcutree.h"
 
 /* Data structures. */
@@ -283,7 +286,9 @@ cpu_has_callbacks_ready_to_invoke(struct rcu_data *rdp)
 static int
 cpu_needs_another_gp(struct rcu_state *rsp, struct rcu_data *rdp)
 {
-	return *rdp->nxttail[RCU_DONE_TAIL] && !rcu_gp_in_progress(rsp);
+	return *rdp->nxttail[RCU_DONE_TAIL +
+			ACCESS_ONCE(rsp->completed) != rdp->completed] &&
+			!rcu_gp_in_progress(rsp);
 }
 
 /*
@@ -575,6 +580,9 @@ static void print_other_cpu_stall(struct rcu_state *rsp)
 	}
 	printk("} (detected by %d, t=%ld jiffies)\n",
 	       smp_processor_id(), (long)(jiffies - rsp->gp_start));
+#ifdef CONFIG_ARCH_KONA
+	kona_hubtimer_save_state(true);
+#endif
 	trigger_all_cpu_backtrace();
 
 	/* If so configured, complain about tasks blocking the grace period. */
@@ -596,6 +604,9 @@ static void print_cpu_stall(struct rcu_state *rsp)
 	 */
 	printk(KERN_ERR "INFO: %s detected stall on CPU %d (t=%lu jiffies)\n",
 	       rsp->name, smp_processor_id(), jiffies - rsp->gp_start);
+#ifdef CONFIG_ARCH_KONA
+	kona_hubtimer_save_state(true);
+#endif
 	trigger_all_cpu_backtrace();
 
 	raw_spin_lock_irqsave(&rnp->lock, flags);
@@ -618,7 +629,8 @@ static void check_cpu_stall(struct rcu_state *rsp, struct rcu_data *rdp)
 	j = ACCESS_ONCE(jiffies);
 	js = ACCESS_ONCE(rsp->jiffies_stall);
 	rnp = rdp->mynode;
-	if ((ACCESS_ONCE(rnp->qsmask) & rdp->grpmask) && ULONG_CMP_GE(j, js)) {
+	if (rcu_gp_in_progress(rsp) &&
+	    (ACCESS_ONCE(rnp->qsmask) & rdp->grpmask) && ULONG_CMP_GE(j, js)) {
 
 		/* We haven't checked in, so go dump stack. */
 		print_cpu_stall(rsp);

@@ -129,4 +129,11 @@ config DEBUG_S3C_UART
 	  The uncompressor code port configuration is now handled
 	  by CONFIG_S3C_LOWLEVEL_UART_PORT.
 
+	# CONFIG_SEC_DEBUG
+config SEC_DEBUG
+	bool "Enable SEC DEBUG"
+	# CONFIG_SEC_DEBUG_USER
+config SEC_DEBUG_USER
+	bool "Enable SEC USER FAULT DEBUG"
+
 endmenu

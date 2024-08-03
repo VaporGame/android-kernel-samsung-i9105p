@@ -39,6 +39,11 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 
+#ifdef CONFIG_ARCH_KONA
+#include <linux/clk.h>
+#include <mach/io_map.h>
+#endif
+
 #include <asm/io.h>
 #include <asm/irq.h>
 
@@ -153,6 +158,14 @@ struct uart_8250_port {
 	unsigned char		lsr_saved_flags;
 #define MSR_SAVE_FLAGS UART_MSR_ANY_DELTA
 	unsigned char		msr_saved_flags;
+
+#ifdef CONFIG_ARCH_KONA
+	struct clk          *clk;
+#endif
+
+#ifdef CONFIG_ARCH_KONA
+	unsigned int iir;
+#endif
 };
 
 struct irq_info {
@@ -309,6 +322,13 @@ static const struct serial8250_config uart_config[] = {
 				  UART_FCR_T_TRIG_01,
 		.flags		= UART_CAP_FIFO | UART_CAP_RTOIE,
 	},
+	[PORT_KONA] = {
+		.name		= "Kona",
+		.fifo_size	= 256,
+		.tx_loadsz	= 256,
+		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_11,
+		.flags		= UART_CAP_FIFO | UART_CAP_AFE,
+	},
 };
 
 #if defined(CONFIG_MIPS_ALCHEMY)
@@ -461,42 +481,6 @@ static void tsi_serial_out(struct uart_port *p, int offset, int value)
 		writeb(value, p->membase + offset);
 }
 
-/* Save the LCR value so it can be re-written when a Busy Detect IRQ occurs. */
-static inline void dwapb_save_out_value(struct uart_port *p, int offset,
-					int value)
-{
-	struct uart_8250_port *up =
-		container_of(p, struct uart_8250_port, port);
-
-	if (offset == UART_LCR)
-		up->lcr = value;
-}
-
-/* Read the IER to ensure any interrupt is cleared before returning from ISR. */
-static inline void dwapb_check_clear_ier(struct uart_port *p, int offset)
-{
-	if (offset == UART_TX || offset == UART_IER)
-		p->serial_in(p, UART_IER);
-}
-
-static void dwapb_serial_out(struct uart_port *p, int offset, int value)
-{
-	int save_offset = offset;
-	offset = map_8250_out_reg(p, offset) << p->regshift;
-	dwapb_save_out_value(p, save_offset, value);
-	writeb(value, p->membase + offset);
-	dwapb_check_clear_ier(p, save_offset);
-}
-
-static void dwapb32_serial_out(struct uart_port *p, int offset, int value)
-{
-	int save_offset = offset;
-	offset = map_8250_out_reg(p, offset) << p->regshift;
-	dwapb_save_out_value(p, save_offset, value);
-	writel(value, p->membase + offset);
-	dwapb_check_clear_ier(p, save_offset);
-}
-
 static unsigned int io_serial_in(struct uart_port *p, int offset)
 {
 	offset = map_8250_in_reg(p, offset) << p->regshift;
@@ -508,6 +492,8 @@ static void io_serial_out(struct uart_port *p, int offset, int value)
 	offset = map_8250_out_reg(p, offset) << p->regshift;
 	outb(value, p->iobase + offset);
 }
+
+static int serial8250_default_handle_irq(struct uart_port *port);
 
 static void set_io_from_upio(struct uart_port *p)
 {
@@ -540,16 +526,6 @@ static void set_io_from_upio(struct uart_port *p)
 		p->serial_out = tsi_serial_out;
 		break;
 
-	case UPIO_DWAPB:
-		p->serial_in = mem_serial_in;
-		p->serial_out = dwapb_serial_out;
-		break;
-
-	case UPIO_DWAPB32:
-		p->serial_in = mem32_serial_in;
-		p->serial_out = dwapb32_serial_out;
-		break;
-
 	default:
 		p->serial_in = io_serial_in;
 		p->serial_out = io_serial_out;
@@ -557,6 +533,7 @@ static void set_io_from_upio(struct uart_port *p)
 	}
 	/* Remember loaded iotype */
 	up->cur_iotype = p->iotype;
+	p->handle_irq = serial8250_default_handle_irq;
 }
 
 static void
@@ -567,8 +544,6 @@ serial_out_sync(struct uart_8250_port *up, int offset, int value)
 	case UPIO_MEM:
 	case UPIO_MEM32:
 	case UPIO_AU:
-	case UPIO_DWAPB:
-	case UPIO_DWAPB32:
 		p->serial_out(p, offset, value);
 		p->serial_in(p, UART_LCR);	/* safe, no side-effects */
 		break;
@@ -1465,6 +1440,10 @@ receive_chars(struct uart_8250_port *up, unsigned int *status)
 	do {
 		if (likely(lsr & UART_LSR_DR))
 			ch = serial_inp(up, UART_RX);
+#ifdef CONFIG_ARCH_KONA
+		else if (up->iir & UART_IIR_RDI)
+			ch = serial_inp(up, UART_RX);
+#endif
 		else
 			/*
 			 * Intel 82571 has a Serial Over Lan device that will
@@ -1537,6 +1516,20 @@ ignore_char:
 	*status = lsr;
 }
 
+static int xmit_fifo_available(struct uart_8250_port *up)
+{
+	int avail_txsz = up->tx_loadsz;
+#ifdef CONFIG_ARCH_KONA
+#define UART_KONA_TFL 0x20
+#define UART_KONA_USR 0x1F
+	if (up->port.type == PORT_KONA) {
+		int tx_entries = serial_in(up, UART_KONA_TFL) & 0xFF;
+		avail_txsz = (up->tx_loadsz < tx_entries) ? 0 : (up->tx_loadsz-tx_entries);
+	}
+#endif
+	return avail_txsz;
+}
+
 static void transmit_chars(struct uart_8250_port *up)
 {
 	struct circ_buf *xmit = &up->port.state->xmit;
@@ -1548,7 +1541,9 @@ static void transmit_chars(struct uart_8250_port *up)
 		up->port.x_char = 0;
 		return;
 	}
-	if (uart_tx_stopped(&up->port)) {
+
+	/* in case of automatic hw flow control, upper layers should not stop if tty stopped tx */
+	if (!(up->mcr & UART_MCR_AFE) && uart_tx_stopped(&up->port)) {
 		serial8250_stop_tx(&up->port);
 		return;
 	}
@@ -1557,14 +1552,16 @@ static void transmit_chars(struct uart_8250_port *up)
 		return;
 	}
 
-	count = up->tx_loadsz;
-	do {
-		serial_out(up, UART_TX, xmit->buf[xmit->tail]);
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-		up->port.icount.tx++;
-		if (uart_circ_empty(xmit))
-			break;
-	} while (--count > 0);
+	count = xmit_fifo_available(up);
+	if (count > 0) {
+		do {
+			serial_out(up, UART_TX, xmit->buf[xmit->tail]);
+			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+			up->port.icount.tx++;
+			if (uart_circ_empty(xmit))
+				break;
+		} while (--count > 0);
+	}
 
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
 		uart_write_wakeup(&up->port);
@@ -1589,7 +1586,7 @@ static unsigned int check_modem_status(struct uart_8250_port *up)
 			up->port.icount.dsr++;
 		if (status & UART_MSR_DDCD)
 			uart_handle_dcd_change(&up->port, status & UART_MSR_DCD);
-		if (status & UART_MSR_DCTS)
+		if (!(up->mcr & UART_MCR_AFE) && (status & UART_MSR_DCTS))
 			uart_handle_cts_change(&up->port, status & UART_MSR_CTS);
 
 		wake_up_interruptible(&up->port.state->port.delta_msr_wait);
@@ -1614,11 +1611,40 @@ static void serial8250_handle_port(struct uart_8250_port *up)
 
 	if (status & (UART_LSR_DR | UART_LSR_BI))
 		receive_chars(up, &status);
+#ifdef CONFIG_ARCH_KONA
+	else if (up->iir & UART_IIR_RDI)
+		receive_chars(up, &status);
+#endif
 	check_modem_status(up);
 	if (status & UART_LSR_THRE)
 		transmit_chars(up);
 
 	spin_unlock_irqrestore(&up->port.lock, flags);
+}
+
+int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
+{
+	struct uart_8250_port *up =
+		container_of(port, struct uart_8250_port, port);
+
+#ifdef CONFIG_ARCH_KONA
+	up->iir = iir; /* Stash a copy of iir for later */
+#endif
+	if (!(iir & UART_IIR_NO_INT)) {
+		serial8250_handle_port(up);
+		return 1;
+	}
+
+	return 0;
+}
+
+static int serial8250_default_handle_irq(struct uart_port *port)
+{
+	struct uart_8250_port *up =
+		container_of(port, struct uart_8250_port, port);
+	unsigned int iir = serial_in(up, UART_IIR);
+
+	return serial8250_handle_irq(port, iir);
 }
 
 /*
@@ -1648,30 +1674,13 @@ static irqreturn_t serial8250_interrupt(int irq, void *dev_id)
 	l = i->head;
 	do {
 		struct uart_8250_port *up;
-		unsigned int iir;
+		struct uart_port *port;
 
 		up = list_entry(l, struct uart_8250_port, list);
+		port = &up->port;
 
-		iir = serial_in(up, UART_IIR);
-		if (!(iir & UART_IIR_NO_INT)) {
-			serial8250_handle_port(up);
-
+		if (port->handle_irq(port)) {
 			handled = 1;
-
-			end = NULL;
-		} else if ((up->port.iotype == UPIO_DWAPB ||
-			    up->port.iotype == UPIO_DWAPB32) &&
-			  (iir & UART_IIR_BUSY) == UART_IIR_BUSY) {
-			/* The DesignWare APB UART has an Busy Detect (0x07)
-			 * interrupt meaning an LCR write attempt occurred while the
-			 * UART was busy. The interrupt must be cleared by reading
-			 * the UART status register (USR) and the LCR re-written. */
-			unsigned int status;
-			status = *(volatile u32 *)up->port.private_data;
-			serial_out(up, UART_LCR, up->lcr);
-
-			handled = 1;
-
 			end = NULL;
 		} else if (end == NULL)
 			end = l;
@@ -1808,6 +1817,9 @@ static void serial8250_timeout(unsigned long data)
 	unsigned int iir;
 
 	iir = serial_in(up, UART_IIR);
+#ifdef CONFIG_ARCH_KONA
+	up->iir = iir; /* Stash a copy of iir for later */
+#endif
 	if (!(iir & UART_IIR_NO_INT))
 		serial8250_handle_port(up);
 	mod_timer(&up->timer, jiffies + uart_poll_timeout(&up->port));
@@ -1891,7 +1903,8 @@ static unsigned int serial8250_get_mctrl(struct uart_port *port)
 		ret |= TIOCM_RNG;
 	if (status & UART_MSR_DSR)
 		ret |= TIOCM_DSR;
-	if (status & UART_MSR_CTS)
+	/* in case of automatic hw flow control, always show CTS as asserted to avoid dead lock! */
+	if ((up->mcr & UART_MCR_AFE) || (status & UART_MSR_CTS))
 		ret |= TIOCM_CTS;
 	return ret;
 }
@@ -2183,7 +2196,10 @@ static int serial8250_startup(struct uart_port *port)
 		if (is_real_interrupt(up->port.irq))
 			up->port.mctrl |= TIOCM_OUT2;
 
-	serial8250_set_mctrl(&up->port, up->port.mctrl);
+	/* only set OUT1&OUT2,termios is setting flow control signals. */
+#ifndef CONFIG_ARCH_KONA
+	serial8250_set_mctrl(&up->port, up->port.mctrl & (TIOCM_OUT1|TIOCM_OUT2));
+#endif
 
 	/* Serial over Lan (SoL) hack:
 	   Intel 8257x Gigabit ethernet chips have a
@@ -2274,7 +2290,9 @@ static void serial8250_shutdown(struct uart_port *port)
 	} else
 		up->port.mctrl &= ~TIOCM_OUT2;
 
+#ifndef CONFIG_ARCH_KONA
 	serial8250_set_mctrl(&up->port, up->port.mctrl);
+#endif
 	spin_unlock_irqrestore(&up->port.lock, flags);
 
 	/*
@@ -2390,8 +2408,11 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 	 */
 	if (up->capabilities & UART_CAP_AFE && up->port.fifosize >= 32) {
 		up->mcr &= ~UART_MCR_AFE;
-		if (termios->c_cflag & CRTSCTS)
+		if (termios->c_cflag & CRTSCTS) {
+		    up->port.flags &= ~ASYNC_CTS_FLOW;  /* in case of AFE, needs to be ignored to avoid
+		                                         * lock up in serialcore cts handler */
 			up->mcr |= UART_MCR_AFE;
+		}
 	}
 
 	/*
@@ -2570,8 +2591,6 @@ static int serial8250_request_std_resource(struct uart_8250_port *up)
 	case UPIO_TSI:
 	case UPIO_MEM32:
 	case UPIO_MEM:
-	case UPIO_DWAPB:
-	case UPIO_DWAPB32:
 		if (!up->port.mapbase)
 			break;
 
@@ -2608,8 +2627,6 @@ static void serial8250_release_std_resource(struct uart_8250_port *up)
 	case UPIO_TSI:
 	case UPIO_MEM32:
 	case UPIO_MEM:
-	case UPIO_DWAPB:
-	case UPIO_DWAPB32:
 		if (!up->port.mapbase)
 			break;
 
@@ -3050,6 +3067,10 @@ int __init early_serial_setup(struct uart_port *port)
 		p->serial_in = port->serial_in;
 	if (port->serial_out)
 		p->serial_out = port->serial_out;
+	if (port->handle_irq)
+		p->handle_irq = port->handle_irq;
+	else
+		p->handle_irq = serial8250_default_handle_irq;
 
 	return 0;
 }
@@ -3118,11 +3139,16 @@ static int __devinit serial8250_probe(struct platform_device *dev)
 		port.type		= p->type;
 		port.serial_in		= p->serial_in;
 		port.serial_out		= p->serial_out;
+		port.handle_irq		= p->handle_irq;
 		port.set_termios	= p->set_termios;
 		port.pm			= p->pm;
 		port.dev		= &dev->dev;
 		port.irqflags		|= irqflag;
+#ifdef CONFIG_ARCH_KONA
+		ret = serial8250_register_port(&port, p->clk_name);
+#else
 		ret = serial8250_register_port(&port);
+#endif
 		if (ret < 0) {
 			dev_err(&dev->dev, "unable to register port at index %d "
 				"(IO%lx MEM%llx IRQ%d): %d\n", i,
@@ -3149,9 +3175,13 @@ static int __devexit serial8250_remove(struct platform_device *dev)
 	return 0;
 }
 
+int UART_ready=1;
+EXPORT_SYMBOL(UART_ready);
+
 static int serial8250_suspend(struct platform_device *dev, pm_message_t state)
 {
 	int i;
+	UART_ready = 0;
 
 	for (i = 0; i < UART_NR; i++) {
 		struct uart_8250_port *up = &serial8250_ports[i];
@@ -3173,6 +3203,7 @@ static int serial8250_resume(struct platform_device *dev)
 		if (up->port.type != PORT_UNKNOWN && up->port.dev == &dev->dev)
 			serial8250_resume_port(i);
 	}
+	UART_ready=1;
 
 	return 0;
 }
@@ -3246,7 +3277,11 @@ static struct uart_8250_port *serial8250_find_match_or_unused(struct uart_port *
  *
  *	On success the port is ready to use and the line number is returned.
  */
+#ifdef CONFIG_ARCH_KONA
+int serial8250_register_port(struct uart_port *port, const unsigned char * clk_name)
+#else
 int serial8250_register_port(struct uart_port *port)
+#endif
 {
 	struct uart_8250_port *uart;
 	int ret = -ENOSPC;
@@ -3260,6 +3295,20 @@ int serial8250_register_port(struct uart_port *port)
 	if (uart) {
 		uart_remove_one_port(&serial8250_reg, &uart->port);
 
+#if defined(CONFIG_ARCH_KONA) && !(defined (CONFIG_ARCH_SAMOA) || defined (CONFIG_MACH_CAPRI_FPGA))
+        uart->clk = clk_get(uart->port.dev, clk_name);
+        if (IS_ERR(uart->clk))
+            return PTR_ERR(uart->clk);
+
+#if defined(CONFIG_DEBUG_LL) && defined(CONFIG_EARLY_PRINTK)
+	/* Don't set the speed on the UART used for early prints */
+	if (port->mapbase != KONA_UART_LLDEBUG_PA)
+		clk_set_rate(uart->clk, port->uartclk);
+#else
+	clk_set_rate(uart->clk, port->uartclk);
+#endif
+	port->uartclk = clk_get_rate(uart->clk);
+#endif
 		uart->port.iobase       = port->iobase;
 		uart->port.membase      = port->membase;
 		uart->port.irq          = port->irq;
@@ -3283,6 +3332,8 @@ int serial8250_register_port(struct uart_port *port)
 			uart->port.serial_in = port->serial_in;
 		if (port->serial_out)
 			uart->port.serial_out = port->serial_out;
+		if (port->handle_irq)
+			uart->port.handle_irq = port->handle_irq;
 		/*  Possibly override set_termios call */
 		if (port->set_termios)
 			uart->port.set_termios = port->set_termios;

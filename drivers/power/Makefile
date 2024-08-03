@@ -14,6 +14,8 @@ obj-$(CONFIG_WM831X_POWER)	+= wm831x_power.o
 obj-$(CONFIG_WM8350_POWER)	+= wm8350_power.o
 obj-$(CONFIG_TEST_POWER)	+= test_power.o
 
+obj-$(CONFIG_BCM_FAKE_BATTERY_DRIVER) += fake_battery.o
+obj-$(CONFIG_BCM_CMP_BATTERY_MULTI) += cmp_battery_multi.o
 obj-$(CONFIG_BATTERY_DS2760)	+= ds2760_battery.o
 obj-$(CONFIG_BATTERY_DS2780)	+= ds2780_battery.o
 obj-$(CONFIG_BATTERY_DS2782)	+= ds2782_battery.o
@@ -36,3 +38,24 @@ obj-$(CONFIG_CHARGER_ISP1704)	+= isp1704_charger.o
 obj-$(CONFIG_CHARGER_MAX8903)	+= max8903_charger.o
 obj-$(CONFIG_CHARGER_TWL4030)	+= twl4030_charger.o
 obj-$(CONFIG_CHARGER_GPIO)	+= gpio-charger.o
+obj-$(CONFIG_BATTERY_BCM59055)	+= bcm59055_battery.o
+obj-$(CONFIG_MONITOR_ADC121C021_I2C)    += adc121c021_driver.o
+obj-$(CONFIG_MONITOR_BQ27541_I2C)       += bq27541.o
+
+ifeq ($(CONFIG_BCM_CMP_BATTERY_MULTI),m)
+obj-m += cmp_battery.o
+cmp_battery-objs += cmp_battery_multi.o
+endif
+ifeq ($(CONFIG_BCM_CMP_BATTERY_BQ24616),m)
+obj-m += cmp_battery.o
+cmp_battery-objs += cmp_battery_bq24616.o
+endif
+obj-$(CONFIG_POWER_BCMPMU)	+= bcmpmu-batt.o
+obj-$(CONFIG_CHARGER_BCMPMU)	+= bcmpmu-chrgr.o
+obj-$(CONFIG_CHARGER_BCMPMU_SPA) += bcmpmu-chrgr-pb.o
+obj-$(CONFIG_CHARGER_BCMPMU_EXT)	+= bcmpmu-chrgr-ext.o
+obj-$(CONFIG_BCMPMU_EM) 	+= bcmpmu-em.o
+obj-$(CONFIG_SEC_CHARGING_FEATURE) +=spa_power.o
+obj-$(CONFIG_BQ24272_CHARGER) +=bq24272_charger.o
+obj-$(CONFIG_SMB358_CHARGER) +=smb358_charger.o
+obj-$(CONFIG_SEC_CHARGING_FEATURE) +=spa_ps.o

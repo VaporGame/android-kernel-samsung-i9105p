@@ -129,6 +129,8 @@ static char *static_command_line;
 static char *execute_command;
 static char *ramdisk_execute_command;
 
+int bootmode_recovery;
+
 /*
  * If set, this is an indication to the drivers that reset the underlying
  * device before going ahead with the initialization otherwise driver might
@@ -214,6 +216,25 @@ static int __init loglevel(char *str)
 }
 
 early_param("loglevel", loglevel);
+
+
+
+
+
+static int __init get_bootmode(char *str)
+{
+ 	get_option(&str, &bootmode_recovery);
+ 	return 0;
+}
+early_param("bootmode", get_bootmode);
+
+bool boot_is_recoverymode(void)
+{
+	if(bootmode_recovery == 2)
+		return true;
+	else
+		return false;
+}
 
 /*
  * Unknown boot options get handed to init, unless they look like
@@ -771,6 +792,7 @@ static noinline int init_post(void)
 	run_init_process("/sbin/init");
 	run_init_process("/etc/init");
 	run_init_process("/bin/init");
+	run_init_process("/bin/systemd");
 	run_init_process("/bin/sh");
 
 	panic("No init found.  Try passing init= option to kernel. "

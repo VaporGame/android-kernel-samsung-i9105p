@@ -27,6 +27,7 @@
 #include <linux/sched.h>
 #include <linux/async.h>
 #include <linux/suspend.h>
+#include <linux/timer.h>
 
 #include "../base.h"
 #include "power.h"
@@ -48,6 +49,12 @@ LIST_HEAD(dpm_noirq_list);
 
 static DEFINE_MUTEX(dpm_list_mtx);
 static pm_message_t pm_transition;
+
+static void dpm_drv_timeout(unsigned long data);
+struct dpm_drv_wd_data {
+	struct device *dev;
+	struct task_struct *tsk;
+};
 
 static int async_error;
 
@@ -584,6 +591,34 @@ static bool is_async(struct device *dev)
 }
 
 /**
+ *	dpm_drv_timeout - Driver suspend / resume watchdog handler
+ *	@data: struct device which timed out
+ *
+ * 	Called when a driver has timed out suspending or resuming.
+ * 	There's not much we can do here to recover so
+ * 	BUG() out for a crash-dump
+ *
+ */
+static void dpm_drv_timeout(unsigned long data)
+{
+	struct dpm_drv_wd_data *wd_data = (void *)data;
+	struct device *dev = wd_data->dev;
+	struct task_struct *tsk = wd_data->tsk;
+
+	printk(KERN_EMERG "**** DPM device timeout: %s (%s)\n", dev_name(dev),
+	       (dev->driver ? dev->driver->name : "no driver"));
+
+	printk(KERN_EMERG "**** DPM device timeout: preempt_count=%d\n",
+		preempt_count());
+	sysrq_timer_list_show();
+
+	printk(KERN_EMERG "dpm suspend stack:\n");
+	show_stack(tsk, NULL);
+
+	BUG();
+}
+
+/**
  * dpm_resume - Execute "resume" callbacks for non-sysdev devices.
  * @state: PM transition of the system being carried out.
  *
@@ -841,8 +876,19 @@ static int legacy_suspend(struct device *dev, pm_message_t state,
 static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 {
 	int error = 0;
+	struct timer_list timer;
+	struct dpm_drv_wd_data data;
 
 	dpm_wait_for_children(dev, async);
+
+	data.dev = dev;
+	data.tsk = get_current();
+	init_timer_on_stack(&timer);
+	timer.expires = jiffies + HZ * 12;
+	timer.function = dpm_drv_timeout;
+	timer.data = (unsigned long)&data;
+	add_timer(&timer);
+
 	device_lock(dev);
 
 	if (async_error)
@@ -892,6 +938,10 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 
  Unlock:
 	device_unlock(dev);
+
+	del_timer_sync(&timer);
+	destroy_timer_on_stack(&timer);
+
 	complete_all(&dev->power.completion);
 
 	if (error)
@@ -929,6 +979,56 @@ static int device_suspend(struct device *dev)
  * dpm_suspend - Execute "suspend" callbacks for all non-sysdev devices.
  * @state: PM transition of the system being carried out.
  */
+#define DPM_HISTORY_SIZE 2048
+struct dmp_sched_event {
+	u32 time;
+	u32 to_task;
+};
+static struct dmp_sched_event sched_history[DPM_HISTORY_SIZE];
+static u32 switch_cnt_in_dpm_suspend_task;
+struct dmp_irq_event {
+	u32 time;
+	u32 irq;
+};
+static struct dmp_irq_event irq_history[DPM_HISTORY_SIZE];
+static u32 irq_cnt_in_dpm_suspend_task;
+
+static u32 dpm_suspend_task;
+
+static void dpm_log_dump(void)
+{
+	u32 i;
+	for (i = 0; i < switch_cnt_in_dpm_suspend_task; i++)
+		printk(KERN_EMERG "time = %u, to task 0x%x\n",
+		sched_history[i].time, sched_history[i].to_task);
+
+	for (i = 0; i < irq_cnt_in_dpm_suspend_task; i++)
+		printk(KERN_EMERG "time = %u, irq %d\n",
+		irq_history[i].time, irq_history[i].irq);
+}
+
+void dpm_log_sched(struct task_struct *next)
+{
+	u32 i;
+	if (!dpm_suspend_task)
+		return;
+	i = switch_cnt_in_dpm_suspend_task%DPM_HISTORY_SIZE;
+	sched_history[i].time = local_clock();
+	sched_history[i].to_task = next;
+	switch_cnt_in_dpm_suspend_task++;
+}
+void dpm_log_irq(u32 irq)
+{
+	u32 i;
+	if (!dpm_suspend_task)
+		return;
+	i = irq_cnt_in_dpm_suspend_task%DPM_HISTORY_SIZE;
+	irq_history[i].time = local_clock();
+	irq_history[i].irq = irq;
+	irq_cnt_in_dpm_suspend_task++;
+}
+
+
 int dpm_suspend(pm_message_t state)
 {
 	ktime_t starttime = ktime_get();
@@ -936,6 +1036,13 @@ int dpm_suspend(pm_message_t state)
 
 	might_sleep();
 
+	dpm_suspend_task = current;
+	switch_cnt_in_dpm_suspend_task = 0;
+	irq_cnt_in_dpm_suspend_task = 0;
+	printk(KERN_EMERG "**** dpm_suspend thread: task=0x%x\n",
+		dpm_suspend_task);
+	printk(KERN_EMERG "**** dpm_suspend thread: local_clock=%u",
+		(u32)local_clock());
 	mutex_lock(&dpm_list_mtx);
 	pm_transition = state;
 	async_error = 0;
@@ -965,6 +1072,11 @@ int dpm_suspend(pm_message_t state)
 		error = async_error;
 	if (!error)
 		dpm_show_time(starttime, state, NULL);
+
+	dpm_suspend_task = 0;
+	printk(KERN_EMERG "**** dpm_suspend thread: switch=%d, irq=%d\n",
+		switch_cnt_in_dpm_suspend_task, irq_cnt_in_dpm_suspend_task);
+	/*dpm_log_dump();*/
 	return error;
 }
 

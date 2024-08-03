@@ -1080,6 +1080,7 @@ static int usblp_probe(struct usb_interface *intf,
 	int protocol;
 	int retval;
 
+	printk("USBD][%s] Probe USB Printer \n",__func__);
 	/* Malloc and start initializing usblp structure so we can use it
 	 * directly. */
 	usblp = kzalloc(sizeof(struct usblp), GFP_KERNEL);

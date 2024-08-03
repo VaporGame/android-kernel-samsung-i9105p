@@ -22,6 +22,10 @@
 #include "mmc_ops.h"
 #include "sd_ops.h"
 
+#ifdef CONFIG_MMC_BCM_SD
+#include "../host/sdhci.h"
+#endif
+
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
 	0,		0,		0,		0
@@ -105,6 +109,26 @@ static int mmc_decode_cid(struct mmc_card *card)
 			mmc_hostname(card->host), card->csd.mmca_vsn);
 		return -EINVAL;
 	}
+
+
+	/*
+	 * Vendor specification
+	 */
+	switch (card->cid.manfid) {
+	case 0x15:
+//		printk("%s, %d : %x - Samsung semi device\n", __FUNCTION__, __LINE__, card->cid.manfid);
+		break;
+
+	case 0x45:
+//		printk("%s, %d : %x - Sandisk device\n", __FUNCTION__, __LINE__, card->cid.manfid);
+		card->quirks	|= MMC_QUIRK_RESET_FOR_CARD_INIT;
+		break;
+
+	default:
+//		printk("%s, %d : %x - Unknown device\n", __FUNCTION__, __LINE__, card->cid.manfid);
+		break;
+	}
+
 
 	return 0;
 }
@@ -259,9 +283,14 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 	}
 
 	card->ext_csd.rev = ext_csd[EXT_CSD_REV];
-	if (card->ext_csd.rev > 5) {
-		printk(KERN_ERR "%s: unrecognised EXT_CSD revision %d\n",
-			mmc_hostname(card->host), card->ext_csd.rev);
+#ifdef CONFIG_MMC_BCM_SD
+	if (card->ext_csd.rev > 7) {
+#else
+	if (card->ext_csd.rev > 3) {
+#endif
+		printk(KERN_ERR "%s: unrecognised EXT_CSD structure "
+			"version %d\n", mmc_hostname(card->host),
+			card->ext_csd.rev);
 		err = -EINVAL;
 		goto out;
 	}
@@ -344,7 +373,7 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 	}
 
 	card->ext_csd.raw_hc_erase_gap_size =
-		ext_csd[EXT_CSD_PARTITION_ATTRIBUTE];
+		ext_csd[EXT_CSD_HC_WP_GRP_SIZE];
 	card->ext_csd.raw_sec_trim_mult =
 		ext_csd[EXT_CSD_SEC_TRIM_MULT];
 	card->ext_csd.raw_sec_erase_mult =
@@ -401,6 +430,12 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 			ext_csd[EXT_CSD_SEC_FEATURE_SUPPORT];
 		card->ext_csd.trim_timeout = 300 *
 			ext_csd[EXT_CSD_TRIM_MULT];
+
+		card->ext_csd.rpmb_size =
+			ext_csd[EXT_CSD_RPMB_SIZE_MULT] << 17;
+
+		printk(KERN_INFO "%s: card->ext_csd.rpmb_size: %d\n",
+			__func__, card->ext_csd.rpmb_size);
 	}
 
 	if (card->ext_csd.rev >= 5)
@@ -411,6 +446,20 @@ static int mmc_read_ext_csd(struct mmc_card *card, u8 *ext_csd)
 		card->erased_byte = 0xFF;
 	else
 		card->erased_byte = 0x0;
+
+#ifdef CONFIG_MMC_45_FEATURE_SUPPORT
+
+	/* eMMC v4.5(Revision 1.6) or later */
+	if (card->ext_csd.rev >= 6) {
+		/* Discard should be supported */
+		/* Senitize should be supported */
+	}
+
+#ifdef CONFIG_MMC_DISCARD_SAMSUNG_eMMC_SUPPORT
+	card->ext_csd.optimized_features	= ext_csd[EXT_CSD_OPTIMIZED_FEATURES];
+#endif
+
+#endif
 
 out:
 	return err;
@@ -442,7 +491,7 @@ static int mmc_compare_ext_csds(struct mmc_card *card, unsigned bus_width)
 		goto out;
 
 	/* only compare read only fields */
-	err = (!(card->ext_csd.raw_partition_support ==
+	err = !((card->ext_csd.raw_partition_support ==
 			bw_ext_csd[EXT_CSD_PARTITION_SUPPORT]) &&
 		(card->ext_csd.raw_erased_mem_count ==
 			bw_ext_csd[EXT_CSD_ERASED_MEM_CONT]) &&
@@ -579,8 +628,20 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		err = mmc_send_cid(host, cid);
 	else
 		err = mmc_all_send_cid(host, cid);
+#if 0 /* Original code before adding temporary workaround for broken MMC parts */
 	if (err)
 		goto err;
+#else
+	if (err){
+		if (err == -ETIMEDOUT || err == -EILSEQ) {
+			pr_debug("%s: Ignoring error %d for mmc_all_send_cid\n",
+				__func__, err);
+			err = 0;
+		} else {
+			goto err;
+		}
+	}
+#endif
 
 	if (oldcard) {
 		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0) {
@@ -711,6 +772,9 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 	 * Activate high speed (if supported)
 	 */
 	if ((card->ext_csd.hs_max_dtr != 0) &&
+#ifdef CONFIG_MMC_BCM_SD
+        (host->f_max > SDHCI_HOST_MAX_CLK_LS_MODE) &&
+#endif
 		(host->caps & MMC_CAP_MMC_HIGHSPEED)) {
 		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 				 EXT_CSD_HS_TIMING, 1, 0);
@@ -907,8 +971,18 @@ static int mmc_suspend(struct mmc_host *host)
 	BUG_ON(!host->card);
 
 	mmc_claim_host(host);
-	if (!mmc_host_is_spi(host))
+
+	if (!mmc_host_is_spi(host)) {
+		if ( host->card->quirks & MMC_QUIRK_RESET_FOR_CARD_INIT ) {
+//			printk("%s, %d : %s - Reset bus width before suspend\n", __FUNCTION__, __LINE__, mmc_hostname(host));
+			mmc_switch(host->card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_1, 0);
+		} else {
+//			printk("%s, %d : %s - Nothing do before suspend\n", __FUNCTION__, __LINE__, mmc_hostname(host));
+		}
+
 		mmc_deselect_cards(host);
+	}
+
 	host->card->state &= ~MMC_STATE_HIGHSPEED;
 	mmc_release_host(host);
 

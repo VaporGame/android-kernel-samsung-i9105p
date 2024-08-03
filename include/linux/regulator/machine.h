@@ -57,6 +57,7 @@ struct regulator_state {
 	unsigned int mode; /* suspend regulator operating mode */
 	int enabled; /* is regulator enabled in this suspend state */
 	int disabled; /* is the regulator disbled in this suspend state */
+	int always; /* always control for all op mode */
 };
 
 /**

@@ -430,6 +430,11 @@ struct usb_gadget_ops {
 	int	(*pullup) (struct usb_gadget *, int is_on);
 	int	(*ioctl)(struct usb_gadget *,
 				unsigned code, unsigned long param);
+	int	(*lpm_support)(struct usb_gadget *);
+#ifdef CONFIG_USB_PCD_SETTINGS
+	int	(*pcd_start_clean) (struct usb_gadget *, int is_start);
+#endif
+	bool (*is_rid_c)(struct usb_gadget *);
 };
 
 /**
@@ -482,10 +487,15 @@ struct usb_gadget {
 	enum usb_device_speed		speed;
 	unsigned			is_dualspeed:1;
 	unsigned			is_otg:1;
+	unsigned			is_lpm:1;
+	u16				otg_version;
+#define UDC_OTG1 0x0000
+#define UDC_OTG2 0x0001
 	unsigned			is_a_peripheral:1;
 	unsigned			b_hnp_enable:1;
 	unsigned			a_hnp_support:1;
 	unsigned			a_alt_hnp_support:1;
+	unsigned 			host_request:1;
 	const char			*name;
 	struct device			dev;
 };
@@ -534,6 +544,47 @@ static inline int gadget_is_otg(struct usb_gadget *g)
 #else
 	return 0;
 #endif
+}
+
+/**
+ * gadget_is_lpm - return true iff the hardware is LPM-ready
+ * @g: controller that might have LPM capability
+ *
+ * This is a runtime test, since kernels with a USB stack sometimes
+ * run on boards which don't support LPM
+ */
+static inline int gadget_is_lpm(struct usb_gadget *g)
+{
+#ifdef CONFIG_USB_LPM
+	return g->is_lpm;
+#else
+	return 0;
+#endif
+}
+
+/**
+ * gadget_is_otg2 - return true if UDC is compliant to OTG 2.0
+ * @g: controller that might have a Mini-AB/Micro-AB connector
+ *
+ */
+static inline int gadget_is_otg2(struct usb_gadget *g)
+{
+#ifdef CONFIG_USB_OTG
+	return g->otg_version && UDC_OTG2;
+#else
+	return 0;
+#endif
+}
+
+/**
+ * gadget_is_rid_c - return true if BC1.2 detects RID C condition
+ */
+static inline int gadget_is_rid_c(struct usb_gadget *g)
+{
+	if (g->ops->is_rid_c)
+		return g->ops->is_rid_c(g);
+	else
+		return 0;
 }
 
 /**
@@ -698,6 +749,38 @@ static inline int usb_gadget_disconnect(struct usb_gadget *gadget)
 	return gadget->ops->pullup(gadget, 0);
 }
 
+#ifdef CONFIG_USB_PCD_SETTINGS
+/**
+ * usb_pcd_enable - enable pcd and initialize endps
+ *
+ * Returns zero on success, else negative errno.
+ */
+static inline int usb_pcd_enable(struct usb_gadget *gadget)
+{
+	if (!gadget->ops->pcd_start_clean)
+		return -EOPNOTSUPP;
+	return gadget->ops->pcd_start_clean(gadget, 1);
+}
+
+/**
+ * usb_pcd_disable - disable pcd and clean up endps
+ *
+ * Returns zero on success, else negative errno.
+ */
+static inline int usb_pcd_disable(struct usb_gadget *gadget)
+{
+	if (!gadget->ops->pcd_start_clean)
+		return -EOPNOTSUPP;
+	return gadget->ops->pcd_start_clean(gadget, 0);
+}
+#endif
+
+static inline int usb_gadget_test_lpm_support(struct usb_gadget *gadget)
+{
+	if (!gadget->ops->lpm_support)
+		return -EOPNOTSUPP;
+	return gadget->ops->lpm_support(gadget);
+}
 
 /*-------------------------------------------------------------------------*/
 
@@ -775,7 +858,6 @@ struct usb_gadget_driver {
 	void			(*disconnect)(struct usb_gadget *);
 	void			(*suspend)(struct usb_gadget *);
 	void			(*resume)(struct usb_gadget *);
-
 	/* FIXME support safe rmmod */
 	struct device_driver	driver;
 };

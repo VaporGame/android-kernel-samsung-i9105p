@@ -3106,6 +3106,9 @@ cfq_cic_lookup(struct cfq_data *cfqd, struct io_context *ioc)
 	if (unlikely(!ioc))
 		return NULL;
 
+	if (unlikely(cfqd == NULL))
+		return NULL;
+
 	rcu_read_lock();
 
 	/*

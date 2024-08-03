@@ -1266,7 +1266,7 @@ static int fuse_writepage_locked(struct page *page)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_req *req;
-	struct fuse_file *ff;
+	struct fuse_file *ff = NULL;
 	struct page *tmp_page;
 
 	set_page_writeback(page);
@@ -1280,10 +1280,15 @@ static int fuse_writepage_locked(struct page *page)
 		goto err_free;
 
 	spin_lock(&fc->lock);
-	BUG_ON(list_empty(&fi->write_files));
-	ff = list_entry(fi->write_files.next, struct fuse_file, write_entry);
-	req->ff = fuse_file_get(ff);
+	if (!list_empty(&fi->write_files)) {
+		ff = list_entry(fi->write_files.next, struct fuse_file,
+			write_entry);
+		req->ff = fuse_file_get(ff);
+	}
 	spin_unlock(&fc->lock);
+
+	if (!ff)
+		goto err_free_tmp_page;
 
 	fuse_write_fill(req, ff, page_offset(page), 0);
 
@@ -1308,6 +1313,8 @@ static int fuse_writepage_locked(struct page *page)
 
 	return 0;
 
+err_free_tmp_page:
+	__free_page(tmp_page);
 err_free:
 	fuse_request_free(req);
 err:

@@ -431,6 +431,7 @@ static void hub_irq(struct urb *urb)
 		dev_dbg (hub->intfdev, "transfer --> %d\n", status);
 		if ((++hub->nerrors < 10) || hub->error)
 			goto resubmit;
+
 		hub->error = status;
 		/* FALL THROUGH */
 
@@ -1075,6 +1076,9 @@ static int hub_configure(struct usb_hub *hub,
 	INIT_WORK(&hub->tt.clear_work, hub_tt_work);
 	switch (hdev->descriptor.bDeviceProtocol) {
 		case 0:
+                        //CGG
+                        dev_dbg(hub_dev, "TT with no hub-specific protocol - "
+                                "no TT\n");
 			break;
 		case 1:
 			dev_dbg(hub_dev, "Single TT\n");
@@ -1091,6 +1095,8 @@ static int hub_configure(struct usb_hub *hub,
 			hub->tt.hub = hdev;
 			break;
 		case 3:
+                        //CGG
+                        dev_dbg(hub_dev, "USB 3.0 hub - no TT\n");
 			/* USB 3.0 hubs don't have a TT */
 			break;
 		default:
@@ -1644,11 +1650,17 @@ void usb_disconnect(struct usb_device **pdev)
 {
 	struct usb_device	*udev = *pdev;
 	int			i;
+	/* Removed for coverity */
+	/* struct usb_hcd		*hcd; */
 
 	if (!udev) {
 		pr_debug ("%s nodev\n", __func__);
 		return;
 	}
+
+	/* Coverity REVERSE_INULL fix */
+	/* Unused var */
+	/* hcd = bus_to_hcd(udev->bus); */
 
 	/* mark the device as inactive, so any further urb submissions for
 	 * this device (and any of its children) will fail immediately.
@@ -1657,6 +1669,14 @@ void usb_disconnect(struct usb_device **pdev)
 	usb_set_device_state(udev, USB_STATE_NOTATTACHED);
 	dev_info(&udev->dev, "USB disconnect, device number %d\n",
 			udev->devnum);
+
+#ifdef CONFIG_USB_OTG
+	if (udev->bus->hnp_support && udev->portnum == udev->bus->otg_port) {
+		cancel_delayed_work_sync(&udev->bus->hnp_polling);
+		cancel_delayed_work_sync(&udev->bus->maint_conf_session_for_td);
+		udev->bus->hnp_support = 0;
+	}
+#endif
 
 	usb_lock_device(udev);
 
@@ -1725,6 +1745,17 @@ static inline void announce_device(struct usb_device *udev) { }
 #endif
 
 #ifdef	CONFIG_USB_OTG
+
+#ifdef CONFIG_USB_OTG_WHITELIST
+static int enable_whitelist = 1;
+#else
+static int enable_whitelist = 0;
+#endif
+
+module_param(enable_whitelist, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(enable_whitelist,
+		 "only recognize devices in OTG whitelist if true");
+
 #include "otg_whitelist.h"
 #endif
 
@@ -1762,15 +1793,31 @@ static int usb_enumerate_device_otg(struct usb_device *udev)
 					(port1 == bus->otg_port)
 						? "" : "non-");
 
-				/* enable HNP before suspend, it's simpler */
-				if (port1 == bus->otg_port)
-					bus->b_hnp_enable = 1;
+				/* a_alt_hnp_support is obsoleted */
+				if (port1 != bus->otg_port)
+					goto fail;
+
+				bus->hnp_support = 1;
+
+				/* a_hnp_support is not required for devices
+				 * compliant to revision 2.0 or subsequent
+				 * versions.
+				 */
+				if (desc->bLength == sizeof(*desc) &&
+						le16_to_cpu(desc->bcdOTG) >= 0x200)
+						goto out;
+
+				/* Legacy B-device i.e. compliant to spec
+				 * revision 1.3 expect A-device to set
+				 * a_hnp_support or b_hnp_enable before
+				 * selecting configuration. b_hnp_enable
+				 * is set before suspending the port.
+				 */
+
 				err = usb_control_msg(udev,
 					usb_sndctrlpipe(udev, 0),
 					USB_REQ_SET_FEATURE, 0,
-					bus->b_hnp_enable
-						? USB_DEVICE_B_HNP_ENABLE
-						: USB_DEVICE_A_ALT_HNP_SUPPORT,
+					USB_DEVICE_A_HNP_SUPPORT,
 					0, NULL, 0, USB_CTRL_SET_TIMEOUT);
 				if (err < 0) {
 					/* OTG MESSAGE: report errors here,
@@ -1779,24 +1826,39 @@ static int usb_enumerate_device_otg(struct usb_device *udev)
 					dev_info(&udev->dev,
 						"can't set HNP mode: %d\n",
 						err);
-					bus->b_hnp_enable = 0;
+                                        dev_printk(KERN_CRIT, &udev->dev, "Device Not Connected/Responding\n");
+
+					bus->hnp_support = 0;
+				}
+				else {
+					dev_info(&udev->dev,
+						"HNP Not Supported\n");
 				}
 			}
 		}
 	}
 
+out:
 	if (!is_targeted(udev)) {
 
 		/* Maybe it can talk to us, though we can't talk to it.
 		 * (Includes HNP test device.)
 		 */
-		if (udev->bus->b_hnp_enable || udev->bus->is_b_host) {
+		if (udev->bus->hnp_support) {
 			err = usb_port_suspend(udev, PMSG_SUSPEND);
 			if (err < 0)
 				dev_dbg(&udev->dev, "HNP fail, %d\n", err);
-		}
+              }
 		err = -ENOTSUPP;
-		goto fail;
+	} else if (udev->bus->hnp_support &&
+					udev->portnum == udev->bus->otg_port) {
+		/* HNP polling is introduced in OTG supplement Rev 2.0
+		* and older devices does not support. Work is not
+		* re-armed if device returns STALL. B-Host also performs
+		* HNP polling.
+		*/
+		schedule_delayed_work(&udev->bus->hnp_polling,
+				msecs_to_jiffies(THOST_REQ_POLL));
 	}
 fail:
 #endif
@@ -1892,6 +1954,7 @@ int usb_new_device(struct usb_device *udev)
 	err = usb_enumerate_device(udev);	/* Read descriptors */
 	if (err < 0)
 		goto fail;
+	
 	dev_dbg(&udev->dev, "udev %d, busnum %d, minor = %d\n",
 			udev->devnum, udev->bus->busnum,
 			(((udev->bus->busnum-1) * 128) + (udev->devnum-1)));
@@ -1912,6 +1975,7 @@ int usb_new_device(struct usb_device *udev)
 		dev_err(&udev->dev, "can't device_add, error %d\n", err);
 		goto fail;
 	}
+	printk("USBD][%s] USB Host Enumeration & Registration Success\n",__func__);
 
 	(void) usb_create_ep_devs(&udev->dev, &udev->ep0, udev);
 	usb_mark_last_busy(udev);
@@ -1969,6 +2033,7 @@ int usb_authorize_device(struct usb_device *usb_dev)
 	if (usb_dev->authorized == 1)
 		goto out_authorized;
 
+	/* Coverity 'Unchecked Return Value' ignored */
 	result = usb_autoresume_device(usb_dev);
 	if (result < 0) {
 		dev_err(&usb_dev->dev,
@@ -2330,6 +2395,8 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 	struct usb_hub	*hub = hdev_to_hub(udev->parent);
 	int		port1 = udev->portnum;
 	int		status;
+	char *hnp_en_err[2] = {"USB_HOST_HNP_ENABLED=FALSE", NULL};
+	char **uevent_envp = NULL;
 
 	// dev_dbg(hub->intfdev, "suspend port %d\n", port1);
 
@@ -2353,6 +2420,29 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 				return status;
 		}
 	}
+
+#ifdef CONFIG_USB_OTG
+	if (!udev->bus->is_b_host && udev->bus->hnp_support &&
+					udev->portnum == udev->bus->otg_port) {
+		status = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+						USB_REQ_SET_FEATURE, 0,
+						USB_DEVICE_B_HNP_ENABLE,
+						0, NULL, 0, USB_CTRL_SET_TIMEOUT);
+		if (status < 0) {
+			uevent_envp = hnp_en_err;
+			if (kobject_uevent_env(&udev->dev.kobj,
+				    KOBJ_CHANGE, uevent_envp)) {
+				dev_warn(&udev->dev, "Failed to send uevent for HNP failure\n");
+			}
+
+
+			dev_warn(&udev->dev, "can't enable HNP on port %d, "
+							"status %d\n", port1, status);
+		} else
+			udev->bus->b_hnp_enable = 1;
+	}
+#endif
+
 
 	/* see 7.1.7.6 */
 	if (hub_is_superspeed(hub->hdev))
@@ -2378,8 +2468,8 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 			status = 0;
 	} else {
 		/* device has up to 10 msec to fully suspend */
-		dev_dbg(&udev->dev, "usb %ssuspend\n",
-				(msg.event & PM_EVENT_AUTO ? "auto-" : ""));
+//		dev_dbg(&udev->dev, "usb %ssuspend\n",
+//				(msg.event & PM_EVENT_AUTO ? "auto-" : ""));
 		usb_set_device_state(udev, USB_STATE_SUSPENDED);
 		msleep(10);
 	}
@@ -2506,6 +2596,12 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 	int		port1 = udev->portnum;
 	int		status;
 	u16		portchange, portstatus;
+
+#ifdef CONFIG_USB_OTG
+	if (!udev->bus->is_b_host && udev->bus->hnp_support &&
+					udev->portnum == udev->bus->otg_port)
+		udev->bus->b_hnp_enable = 0;
+#endif
 
 	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	status = hub_port_status(hub, port1, &portstatus, &portchange);
@@ -2933,7 +3029,9 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
 				buf->bMaxPacketSize0 = 0;
 				r = usb_control_msg(udev, usb_rcvaddr0pipe(),
 					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
-					USB_DT_DEVICE << 8, 0,
+                                        USB_DT_DEVICE << 8,
+                                        //USB_DT_DEVICE << 64, // DWC patch suggestion!
+                                        0,
 					buf, GET_DESCRIPTOR_BUFSIZE,
 					initial_descriptor_timeout);
 				switch (buf->bMaxPacketSize0) {
@@ -3183,9 +3281,9 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
 			status = usb_remote_wakeup(udev);
 #endif
 
-		} else {
+		} else
 			status = -ENODEV;	/* Don't resuscitate */
-		}
+
 		usb_unlock_device(udev);
 
 		if (status == 0) {
@@ -3348,14 +3446,17 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
 		return;
 
 loop_disable:
-		hub_port_disable(hub, port1, 1);
+		if (status != -ECONNREFUSED)
+			hub_port_disable(hub, port1, 1);
 loop:
 		usb_ep0_reinit(udev);
 		release_devnum(udev);
 		hub_free_dev(udev);
 		usb_put_dev(udev);
-		if ((status == -ENOTCONN) || (status == -ENOTSUPP))
-			break;
+		if (status == -ENOTCONN || status == -ENOTSUPP ||
+			status == -ECONNREFUSED)
+			// break; //DWC patch
+			return;
 	}
 	if (hub->hdev->parent ||
 			!hcd->driver->port_handed_over ||
@@ -3765,9 +3866,14 @@ static int descriptors_changed(struct usb_device *udev,
 	}
 
 	if (!changed && serial_len) {
+		/* Coverity NEGATIVE_RETURNS. If length is negative, below
+		 * if statement will always be true, since serial_len is
+		 * greater than zero.
+		 */
 		length = usb_string(udev, udev->descriptor.iSerialNumber,
 				buf, serial_len);
-		if (length + 1 != serial_len) {
+		if ((length < 0) ||
+			    (length + 1 != serial_len)) {
 			dev_dbg(&udev->dev, "serial string error %d\n",
 					length);
 			changed = 1;
